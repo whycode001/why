@@ -2,12 +2,12 @@ title: WeiShao Blog
 SEOTitle: 威少的博客|weishao
 header-img: img/home-bg.jpg
 email: weizhao21@gmail.com
-baseurl: ""
+baseurl: "/weishao"
 
 # Sidebar settings
 sidebar: true   
 
-github_username:   zwan0518
+github_username: zwan0518
 
 plugins: [jekyll-paginate]
 paginate: 5
