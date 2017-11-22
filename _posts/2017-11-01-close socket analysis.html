@@ -3,5 +3,148 @@ layout: page
 title: socket关闭分析
 ---
 <h2>{{ page.title }}</h2>
-<p>针对socket来说，其打开和关闭都会有不同的协议规定。</p>
+<p>在网络开发中，socket层提供用户操作网络数据传输。通过socket层的接口，屏蔽了底层不同操作系统网络接口的不同。在附录里几篇文章包括了基本的socket介绍、socket内核支持和常见的socket开发模式。socket其所处的层次可以用下面一张图很好的解释：
+<img  src="{{ site.baseurl }}/img/posts/socket_layer.jpg">
+</p>
+<p>
+对于socket，在其初始化的时候，通过设定不同的协议参数，其表现则会完全不同。在这篇文章就介绍在开发socket的时候，关闭socket的一些细节。通过抓包分析不同参数设置下关闭socket的之后的不同表现。
+
+在socket开发中，可以概括为几个流程：
+<pre>
+1、创建socket
+2、设定相应参数
+3、绑定监听端口
+4、开始监听端口
+5、接受处理端口链接请求
+6、回包或者直接关闭链接
+</pre>
+因为对于网络io和操作系统计算性能俩者的速度不成比例，对于第5步会成为服务端开发的瓶颈。所以对于当前高性能服务端开发，对于第5步有各种开发模式存在。附录里第三个链接《服务端常见开发模式》就介绍了几种不同的socket开发模型。这个不在本篇文章讲述，主要介绍第2步的不同导致的第6步关闭socket的时候的不同表现。
+</p>
+
+<p>
+先抛出一个问题，当客户端关闭链接的之后，服务端继续向这个链接发送内容会发生什么情况？抛出错误？发送正常？<br/>
+下面先给出简单的代码示例，在代码中一些正确性检查都略去了，只给出核心逻辑。代码如下，分为server端和client端。
+<pre>
+//server端
+
+const static int kPort = 9191;
+int main()
+{   
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in server;
+    int length = sizeof(server);  
+    memset(&server, 0, length);  
+    server.sin_family = AF_INET;  
+    server.sin_addr.s_addr = INADDR_ANY;  
+    server.sin_port = htons(kPort); 
+	
+    bind(sock, (struct sockaddr *)&server, length); 
+    listen(sock, 5);
+    while(1) {   
+        sock_peer = accept(sock, (struct sockaddr *) NULL, NULL);
+        sleep(1);//留出客户端强制断开的时间
+        size_t size = send(sock_peer, "success", 8, 0); 
+        printf("send fd %d, size %d, err %s\n", sock_peer, size, strerror(errno));
+        close(sock_peer);   
+    }   
+}
+
+****************************************************************
+
+//client端
+int main()  
+{  
+    int port = 9191;  
+    int length;  
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    //模拟断开场景使用
+    //struct linger lo = {1, 0}; 
+    //setsockopt(sock, SOL_SOCKET, SO_LINGER, &lo, sizeof(lo));
+	
+    struct sockaddr_in server;  
+    length = sizeof(server);  
+    memset(&server, 0, length);  
+    server.sin_family = AF_INET;  
+    server.sin_addr.s_addr = inet_addr("127.0.0.1");  
+    server.sin_port = htons(port);  
+	
+    connect(sock, (struct sockaddr *)&server, length);  
+	
+    const static char *content = "hello";
+    char byte[32];
+    sprintf(byte, "%d_%s", sizeof(content), content);
+    int send_num = send(sock, byte, sizeof(byte), 0)
+    printf("send %d!\n", send_num);
+	
+    sleep(1);//发送成功之后，留出可以强制断开的时间
+    char buf[256];  
+    read(sock, buf, 255);  
+    printf("recv buf %s\n", buf);  
+}  
+</pre>
+
+编译上面代码，启动serer端之后，开始监听链接，然后启动client链接到server端。</br>
+1、模拟正常情况。程序从头执行直到结束，那么server端和client端的输出应该是</br>
+<I>
+server端：send fd 5, size 8, err Success</br>
+client端：</br>
+      send 5</br>
+	  recv buf success</br>
+</I>
+</br>
+2、现在我们模拟client端强制断开的场景。
+在客户端打印“send 5”之后，通过之后，通过ctrl+c强制断开链接，我们看发生情况。</br>
+<I>
+server端：send fd 5, size 8, err Success</br>
+client端：</br>
+      send 5</br>
+</I>
+</br>
+你会发现除了客户端断开链接之后无法接收到server端的回包数据之后，打印输出没什么区别。问题是 <B>client被ctrl+c断开之后，服务端为何还能正常发送数据？</B>因为按照常理来说ctrl+c之后程序是直接就退出的了，为何server端还可以发送数据那，网络层到底是发生了什么那？这就需要我们的tcpdump利器了。启动tcpdump重复上述操作流程进行抓包，具体数据如下：</br>
+ip数据 server：9_30、client：215.207。在删除了其他一些属性之后，留下我们分析必须的数据。其中对Flags有如下几种：S->syn, P->Push，F -> FIN，R -> Reset</br>
+<I>
+1、IP 215.207.50026 > 9_30.websm: Flags [S], seq 4009869210, win 14600, length 0</br>
+2、IP 9_30.websm > 215.207.50026: Flags [S.], seq 1579332706, ack 4009869211, win 14480, length 0</br>
+3、IP 215.207.50026 > 9_30.websm: Flags [.], ack 1, win 115, length 0</br>
+4、IP 215.207.50026 > 9_30.websm: Flags [P.], seq 1:33, ack 1, win 115, length 32</br>
+5、IP 9_30.websm > 215.207.50026: Flags [.], ack 33, win 114, length 0</br>
+6、IP 215.207.50026 > 9_30.websm: Flags [F.], seq 33, ack 1, win 115, length 0</br>
+7、IP 9_30.websm > 215.207.50026: Flags [.], ack 34, win 114, length 0</br>
+8、IP 9_30.websm > 215.207.50026: Flags [P.], seq 1:9, ack 34, win 114, length 8</br>
+9、IP 9_30.websm > 215.207.50026: Flags [F.], seq 9, ack 34, win 114, length 0</br>
+10、IP 215.207.50026 > 9_30.websm: Flags [R], seq 4009869244, win 0, length 0</br>
+11、IP 215.207.50026 > 9_30.websm: Flags [R], seq 4009869244,</br>
+</I>
+</p>
+<p>
+接下来就分析详细的数据包。开始的三行抓包数据，就是经典的TCP三次握手。215.207作为客户端发起链接请求，SYN包的格式并带上seqnum；9_30作为服务端收到客户端的SYN包，之后进行SYN回包，并发送ACK(seq num + 	1)；客户端收到服务端的回包，发送ack，整个链接建立。TCP协议相关的三次握手请查看附录里的链接。
+
+<br/>
+链接建立之后，客户端开始发送数据FLAFS标识为P，服务端收到数据之后发送ACK。接下来的包就是发生在客户端ctrl+c之后的传输的数据。在第6行可以看到，客户端发送了F标识的包，表示要执行FIN断开链接。接下来就进入TCP四次挥手断开阶段。服务端收到FIN包发送ACK，然后服务端开始发送回包P，等发送完之后服务端发送FIN断开链接请求，客户端收到之后按照协议需要发送ACK但是因为客户端程序已经退出，这个时候是直接回复了R,RESET的标识，指出该链接已经断开。<br/>
+</p>
+通过分析分享抓包数据可以看到，当客户端执行ctrl+c之后，链接是平滑关闭的，那有没有可能说 如何使我的程序退出之后就直接关闭整个链接那？这个时候就可以用到SO_LINGER 选项。在client端代码中有设置linger的选项被注释掉，取掉注释重新跑一下流程执行ctrl+c可以发现，服务端不能再发送成功了，给出错误提示<font color="red">Connection reset by peer</font><br/>
+通过抓包可以发现下面数据，在执行ctrl+c之后，客户端没有进行平滑关闭，而是直接发送了R，RESET包关闭链接。<br/>
+<I>
+1、IP 215.207.50026 > 9_30.websm: Flags [S], seq 4009869210, win 14600, length 0</br>
+2、IP 9_30.websm > 215.207.50026: Flags [S.], seq 1579332706, ack 4009869211, win 14480, length 0</br>
+3、IP 215.207.50026 > 9_30.websm: Flags [.], ack 1, win 115, length 0</br>
+4、IP 215.207.50026 > 9_30.websm: Flags [P.], seq 1:33, ack 1, win 115, length 32</br>
+5、IP 9_30.websm > 215.207.50026: Flags [.], ack 33, win 114, length 0</br>
+6、IP 215.207.50026 > 9_30.websm: Flags [R], seq 4009869244,
+</I>
+</p>
+
+<p>
+俩种场景下的不同表现主要就是linger的原因。对于linger来说，其为了解决关闭之后TIME_OUT时间内该链接是否被维持的情况。详细内容可以查看<a href="https://stackoverflow.com/questions/3757289/tcp-option-so-linger-zero-when-its-required", target = "_blank">SO_LINGER (zero) - when it's required</a>。
+</p>
+<p>此时文章就到了结束的时候，本文通过抓包分析，当某一端的参数设置不同导致关闭之后数据发送的表现也不尽相同。通过抓包也可以看到TCP链接的三次握手和断开时候的四次挥手阶段。
+</p>
+<p>
+<B>附录：</B>
+<br/>
+1：<a href="http://blog.csdn.net/zwan0518/article/details/12834873", target="_blank">socket介绍</a><br/>
+2：<a href="http://blog.csdn.net/zwan0518/article/details/49471767"，target="_blank">socket内核介绍</a><br/>
+3：<a href="http://blog.csdn.net/zwan0518/article/details/43025553"，target="_blank">socket常见开发模式</a>
+</p>
+
 <p>{{ page.date | date_to_string }}</p>
